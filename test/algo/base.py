@@ -7,12 +7,20 @@ GaussianMLP
     Two-layer MLP Gaussian policy with manual forward pass, log-prob,
     entropy, and gradient computation.
 ValueMLP
-    Two-layer MLP value function used by PPO and TRPO critics.
+    Two-layer MLP value function used by PPO, A2C, and TRPO critics.
 RLController
     Subclass of :class:`BaseAgentController` that wraps a ``GaussianMLP``
     and implements :meth:`get_action_2d`.
 Rollout
     Named-tuple holding one collected trajectory.
+BaseBenchmark
+    Shared benchmark harness; subclasses only need to implement
+    ``_build_controllers`` and ``train``.
+
+Constants
+---------
+AGENT_OBS_DIMS : dict[str, int]
+    Observation dimensions for each agent role in the standard 2-follower task.
 
 Helper functions
 ----------------
@@ -415,3 +423,127 @@ def collect_rollout(
             buf["dones"].append(False)
 
     return {ag: Rollout(**d) for ag, d in rollouts.items()}
+
+
+# ---------------------------------------------------------------------------
+# Shared benchmark base class
+# ---------------------------------------------------------------------------
+
+# Observation dimensions for each agent role in the standard 2-follower task
+AGENT_OBS_DIMS: dict[str, int] = {
+    "adversary_0": 8,
+    "agent_0": 10,
+    "agent_1": 10,
+}
+
+
+class BaseBenchmark:
+    """Shared benchmark harness for all RL algorithms.
+
+    Subclasses must implement:
+    - ``NAME`` (class attribute, str)
+    - ``_build_controllers(seed)`` → dict[agent_id, RLController]
+    - ``train(num_episodes, seed, verbose)`` → dict[agent_id, RLController]
+
+    The standard environment layout (2 landmarks at ±0.6, 2 followers) is
+    provided by :meth:`_build_env` which delegates to
+    :func:`env_api.build_benchmark_env`.
+
+    Parameters
+    ----------
+    num_good_agents : int
+        Number of follower agents (default 2).
+    """
+
+    NAME: str = "benchmark"
+
+    def __init__(self, num_good_agents: int = 2) -> None:
+        self.num_good_agents = num_good_agents
+
+    def _build_env(self, seed: int):
+        """Build the standard benchmark environment."""
+        from env_api import build_benchmark_env  # lazy import avoids circular dep
+        return build_benchmark_env(num_good_agents=self.num_good_agents)
+
+    def _build_controllers(self, seed: int) -> dict:
+        raise NotImplementedError
+
+    def train(self, num_episodes: int = 200, seed: int = 0, verbose: bool = False) -> dict:
+        raise NotImplementedError
+
+    def evaluate(
+        self,
+        controllers: dict,
+        seed: int = 9999,
+        num_eval_episodes: int = 10,
+    ) -> dict:
+        """Evaluate trained controllers over several episodes.
+
+        Parameters
+        ----------
+        controllers : dict[agent_id -> RLController]
+        seed : int
+        num_eval_episodes : int
+
+        Returns
+        -------
+        dict with keys ``"mean_rewards"`` and ``"all_episode_rewards"``.
+        """
+        all_cum_rewards: list[dict] = []
+        for ep in range(num_eval_episodes):
+            env = self._build_env(seed + ep)
+            env.reset(seed=seed + ep)
+            cum_rewards = {ag: 0.0 for ag in env.possible_agents}
+            for agent in env.agent_iter():
+                obs, rew, term, trunc, _ = env.last()
+                cum_rewards[agent] += rew
+                if term or trunc:
+                    env.step(None)
+                else:
+                    env.step(controllers[agent].get_action(obs))
+            env.close()
+            all_cum_rewards.append(cum_rewards)
+
+        mean_rewards = {
+            ag: float(np.mean([r[ag] for r in all_cum_rewards]))
+            for ag in all_cum_rewards[0]
+        }
+        return {"mean_rewards": mean_rewards, "all_episode_rewards": all_cum_rewards}
+
+    @classmethod
+    def run(
+        cls,
+        num_episodes: int = 200,
+        num_eval_episodes: int = 10,
+        seed: int = 0,
+        verbose: bool = True,
+        **kwargs,
+    ) -> dict:
+        """Train then evaluate all agents.
+
+        Parameters
+        ----------
+        num_episodes : int
+        num_eval_episodes : int
+        seed : int
+        verbose : bool
+        **kwargs
+            Forwarded to the subclass constructor.
+
+        Returns
+        -------
+        dict with keys ``"name"``, ``"controllers"``, ``"mean_rewards"``,
+        ``"all_episode_rewards"``.
+        """
+        bench = cls(**kwargs)
+        print(f"=== {bench.NAME}: training for {num_episodes} episodes ===")
+        controllers = bench.train(num_episodes=num_episodes, seed=seed, verbose=verbose)
+        print(f"=== {bench.NAME}: evaluating for {num_eval_episodes} episodes ===")
+        eval_result = bench.evaluate(controllers, seed=seed + 10000, num_eval_episodes=num_eval_episodes)
+        print(f"=== {bench.NAME}: mean_rewards = {eval_result['mean_rewards']} ===")
+        return {
+            "name": bench.NAME,
+            "controllers": controllers,
+            **eval_result,
+        }
+

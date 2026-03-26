@@ -1,19 +1,28 @@
 """
-PPO-benchmark
+A2C-benchmark
 =============
 
-Proximal Policy Optimization (Schulman et al., 2017) applied to the
-MPE2 leader-follower environment.
+Advantage Actor-Critic (Mnih et al., 2016) applied to the MPE2
+leader-follower environment.
 
-All three controllers (adversary_0, agent_0, agent_1) use independent PPO
-policies but are trained inside the same shared environment interaction loop.
+A2C maintains both an actor (policy) and a critic (value function).
+The policy gradient uses TD-based advantages:
+
+    A(s_t, a_t) = r_t + γ V(s_{t+1}) - V(s_t)
+
+summed via GAE-lambda for variance reduction.  Unlike PPO there is no
+importance-ratio clipping; a single gradient-ascent step is applied per
+rollout (no mini-batch epochs).
+
+All three controllers (adversary_0, agent_0, agent_1) use independent A2C
+policies trained inside the same shared environment interaction loop.
 
 Usage
 -----
 ::
 
-    from algo.ppo_benchmark import PPOBenchmark
-    results = PPOBenchmark.run(num_episodes=200, seed=0)
+    from algo.a2c_benchmark import A2CBenchmark
+    results = A2CBenchmark.run(num_episodes=200, seed=0)
     print(results["mean_rewards"])
 """
 
@@ -39,82 +48,56 @@ from base import (  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
-# PPO update
+# A2C update
 # ---------------------------------------------------------------------------
 
-def _ppo_update(
+def _a2c_update(
     policy: GaussianMLP,
     obs_list: list,
     action_list: list,
-    old_log_probs: np.ndarray,
     advantages: np.ndarray,
     lr: float = 3e-4,
-    clip_eps: float = 0.2,
-    epochs: int = 4,
-    minibatch: int = 32,
+    entropy_coeff: float = 0.01,
 ) -> None:
-    """In-place PPO policy update using clipped surrogate objective.
+    """In-place A2C actor update.
+
+    A single gradient-ascent step on the policy objective:
+
+        ∇_θ J ≈ (1/T) Σ_t [ A_t · ∇_θ log π(a_t|s_t)
+                             + β · ∇_θ H[π(·|s_t)] ]
 
     Parameters
     ----------
     policy        : GaussianMLP to update
-    obs_list      : list of observations collected under the old policy
-    action_list   : list of actions taken
-    old_log_probs : log-probs under the old policy  (T,)
+    obs_list      : list of observations
+    action_list   : list of actions
     advantages    : GAE advantages  (T,)
-    lr            : learning rate
-    clip_eps      : clipping radius ε
-    epochs        : number of passes over the data
-    minibatch     : mini-batch size
+    lr            : actor learning rate
+    entropy_coeff : entropy regularisation coefficient β
     """
     T = len(obs_list)
-    # Normalise advantages
-    adv = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
-
-    for _ in range(epochs):
-        indices = np.random.permutation(T)
-        for start in range(0, T, minibatch):
-            batch_idx = indices[start: start + minibatch]
-            grad = np.zeros(policy.num_params(), dtype=np.float64)
-
-            for i in batch_idx:
-                obs = obs_list[i]
-                act = action_list[i]
-                A_i = adv[i]
-                old_lp = old_log_probs[i]
-
-                new_lp = policy.log_prob(obs, act)
-                ratio = np.exp(new_lp - old_lp)
-
-                # Determine whether the clipped or unclipped term is active
-                if A_i >= 0:
-                    use_ratio = ratio if ratio <= 1.0 + clip_eps else 0.0
-                else:
-                    use_ratio = ratio if ratio >= 1.0 - clip_eps else 0.0
-
-                if use_ratio != 0.0:
-                    lp_grad = policy.log_prob_grad(obs, act)
-                    grad += ratio * A_i * lp_grad
-
-            grad /= max(len(batch_idx), 1)
-            # Gradient ascent
-            params = policy.get_flat_params()
-            policy.set_flat_params(params + lr * grad)
+    adv_norm = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+    grad = np.zeros(policy.num_params(), dtype=np.float64)
+    for i in range(T):
+        lp_grad = policy.log_prob_grad(obs_list[i], action_list[i])
+        grad += adv_norm[i] * lp_grad
+        grad += entropy_coeff * policy.entropy_grad()
+    grad /= T
+    params = policy.get_flat_params()
+    policy.set_flat_params(params + lr * grad)
 
 
 # ---------------------------------------------------------------------------
-# PPO controller
+# A2C controller
 # ---------------------------------------------------------------------------
 
-class PPOController(RLController):
-    """Controller whose policy is updated via PPO.
+class A2CController(RLController):
+    """Controller whose policy is updated via A2C.
 
     Parameters
     ----------
     obs_dim : int
-        Observation dimension for this agent.
     seed : int
-        Seed for the internal RNG.
     """
 
     def __init__(self, obs_dim: int, seed: int = 0) -> None:
@@ -128,29 +111,26 @@ class PPOController(RLController):
 
 
 # ---------------------------------------------------------------------------
-# PPO Benchmark
+# A2C Benchmark
 # ---------------------------------------------------------------------------
 
-class PPOBenchmark(BaseBenchmark):
-    """Train and evaluate all agents with PPO.
+class A2CBenchmark(BaseBenchmark):
+    """Train and evaluate all agents with A2C.
 
     Parameters
     ----------
     num_good_agents : int
-        Number of good (follower) agents (default 2).
     gamma : float
         Discount factor.
     lam : float
-        GAE lambda.
+        GAE lambda for advantage estimation.
     lr : float
-        Policy learning rate.
-    clip_eps : float
-        PPO clipping radius.
-    ppo_epochs : int
-        Number of PPO update epochs per rollout.
+        Actor learning rate.
+    entropy_coeff : float
+        Entropy regularisation coefficient β.
     """
 
-    NAME = "PPO-benchmark"
+    NAME = "A2C-benchmark"
 
     def __init__(
         self,
@@ -158,19 +138,17 @@ class PPOBenchmark(BaseBenchmark):
         gamma: float = 0.99,
         lam: float = 0.95,
         lr: float = 3e-4,
-        clip_eps: float = 0.2,
-        ppo_epochs: int = 4,
+        entropy_coeff: float = 0.01,
     ) -> None:
         super().__init__(num_good_agents=num_good_agents)
         self.gamma = gamma
         self.lam = lam
         self.lr = lr
-        self.clip_eps = clip_eps
-        self.ppo_epochs = ppo_epochs
+        self.entropy_coeff = entropy_coeff
 
-    def _build_controllers(self, seed: int) -> dict[str, PPOController]:
+    def _build_controllers(self, seed: int) -> dict[str, A2CController]:
         return {
-            ag: PPOController(obs_dim=dim, seed=seed + i * 100)
+            ag: A2CController(obs_dim=dim, seed=seed + i * 100)
             for i, (ag, dim) in enumerate(AGENT_OBS_DIMS.items())
         }
 
@@ -179,7 +157,7 @@ class PPOBenchmark(BaseBenchmark):
         num_episodes: int = 200,
         seed: int = 0,
         verbose: bool = False,
-    ) -> dict[str, PPOController]:
+    ) -> dict[str, A2CController]:
         """Train all controllers for ``num_episodes`` episodes."""
         controllers = self._build_controllers(seed)
         value_nets = {ag: controllers[ag].value_net for ag in controllers}
@@ -200,15 +178,13 @@ class PPOBenchmark(BaseBenchmark):
                 advantages, returns = compute_gae(
                     rollout.rewards, rollout.values, 0.0, self.gamma, self.lam,
                 )
-                _ppo_update(
+                _a2c_update(
                     policy,
                     rollout.observations,
                     rollout.actions,
-                    np.array(rollout.log_probs, dtype=np.float64),
                     advantages,
                     lr=self.lr,
-                    clip_eps=self.clip_eps,
-                    epochs=self.ppo_epochs,
+                    entropy_coeff=self.entropy_coeff,
                 )
                 vnet.update(rollout.observations, returns, epochs=4)
                 ep_rewards[ag] = float(np.sum(rollout.rewards))
@@ -224,5 +200,5 @@ class PPOBenchmark(BaseBenchmark):
 
 
 if __name__ == "__main__":
-    results = PPOBenchmark.run(num_episodes=100, num_eval_episodes=5, seed=0, verbose=True)
+    results = A2CBenchmark.run(num_episodes=100, num_eval_episodes=5, seed=0, verbose=True)
     print("mean_rewards:", results["mean_rewards"])

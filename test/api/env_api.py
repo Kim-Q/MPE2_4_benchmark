@@ -165,6 +165,41 @@ def build_custom_env(
     env = wrappers.OrderEnforcingWrapper(env)
     return env
 
+def build_benchmark_env(num_good_agents: int = 2, max_cycles: int = 25):
+    """Standard benchmark environment used by all RL algorithm benchmarks.
+
+    Uses fixed landmark positions and follower goal weights so that
+    different algorithms are compared on exactly the same task.
+
+    Parameters
+    ----------
+    num_good_agents : int
+        Number of follower agents (default 2).
+    max_cycles : int
+        Episode length (default 25).
+
+    Returns
+    -------
+    A wrapped PettingZoo AEC environment.
+    """
+    lm_cfgs = [
+        LandmarkConfig(position=np.array([0.6, 0.0]), name="goal_0"),
+        LandmarkConfig(position=np.array([-0.6, 0.0]), name="goal_1"),
+    ]
+    follower_goal_weights = {
+        "agent_0": np.array([0.8, 0.2]),
+        "agent_1": np.array([0.2, 0.8]),
+    }
+    return build_custom_env(
+        num_good_agents=num_good_agents,
+        landmark_configs=lm_cfgs,
+        follower_goal_weights=follower_goal_weights,
+        max_cycles=max_cycles,
+        continuous_actions=True,
+        render_mode=None,
+    )
+
+
 if __name__ == "__main__":
     # ========================= 演示入口说明 =========================
     # 本入口用于“环境 API 层”的最小可运行示例，核心目的是做快速自检：

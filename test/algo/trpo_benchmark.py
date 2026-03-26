@@ -35,11 +35,11 @@ from base import (  # noqa: E402
     GaussianMLP,
     ValueMLP,
     RLController,
+    BaseBenchmark,
+    AGENT_OBS_DIMS,
     compute_gae,
     collect_rollout,
 )
-from env_api import build_custom_env, LandmarkConfig  # noqa: E402
-from controller_api import action2d_to_simple_adversary_continuous  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -71,25 +71,10 @@ def _fisher_vector_product(
     """Approximate Fisher-vector product F·v using the empirical Fisher.
 
     F·v ≈ (1/T) Σ_t  (∇ log π_t) · (∇ log π_t)^T · v
-
-    Parameters
-    ----------
-    policy   : current GaussianMLP
-    obs_list : list of observations
-    vector   : v  (flat parameter vector of same length as policy params)
-    damping  : damping coefficient added to diagonal for numerical stability
-
-    Returns
-    -------
-    Fv : np.ndarray
     """
     T = len(obs_list)
-    # For diagonal Gaussian, the Fisher w.r.t. mean params equals E[(∇ log π)(∇ log π)^T]
-    # We approximate by: (1/T) * J^T J * v  where J[i,:] = ∇_θ log π(a_i | s_i)
-    # Efficient: Fv = (1/T) Σ_i (J[i] · v) * J[i]  (Gauss-Newton trick)
     Fv = np.zeros_like(vector, dtype=np.float64)
     for i in range(T):
-        # Reuse the action stored in rollout to get gradient
         j_i = policy.log_prob_grad(obs_list[i], _action_cache[i])
         Fv += np.dot(j_i, vector) * j_i
     Fv /= T
@@ -148,18 +133,14 @@ def _kl_divergence(
     old_means: list,
     old_stds: list,
 ) -> float:
-    """Average KL divergence KL(old || new) for Diagonal Gaussians.
-
-    KL(N(μ₁, σ₁) || N(μ₂, σ₂)) = Σᵢ [log(σ₂ᵢ/σ₁ᵢ)
-                                    + (σ₁ᵢ² + (μ₁ᵢ-μ₂ᵢ)²)/(2 σ₂ᵢ²) - 0.5]
-    """
+    """Average KL divergence KL(old || new) for Diagonal Gaussians."""
     total_kl = 0.0
     T = len(old_means)
     new_std = np.exp(policy.log_std)
     for i in range(T):
         mu1 = old_means[i]
         s1 = old_stds[i]
-        mu2, _ = policy.forward(policy._obs_cache[i])  # new policy
+        mu2, _ = policy.forward(policy._obs_cache[i])
         kl = np.sum(
             np.log(new_std / s1)
             + (s1 ** 2 + (mu1 - mu2) ** 2) / (2.0 * new_std ** 2)
@@ -191,9 +172,7 @@ def _trpo_update(
        step that does not violate the KL constraint.
     """
     global _action_cache
-    _action_cache = action_list  # make available to Fisher-vector product
-
-    T = len(obs_list)
+    _action_cache = action_list
 
     # Capture old means and stds (before update)
     old_means = []
@@ -202,7 +181,6 @@ def _trpo_update(
         m, s = policy.forward(obs)
         old_means.append(m.copy())
         old_stds.append(s.copy())
-    # Store obs list on policy for KL computation (TRPO)
     policy._obs_cache = obs_list
 
     # 1. Policy gradient
@@ -267,7 +245,7 @@ class TRPOController(RLController):
 # TRPO Benchmark
 # ---------------------------------------------------------------------------
 
-class TRPOBenchmark:
+class TRPOBenchmark(BaseBenchmark):
     """Train and evaluate all agents with TRPO.
 
     Parameters
@@ -294,38 +272,18 @@ class TRPOBenchmark:
         cg_iters: int = 10,
         damping: float = 0.1,
     ) -> None:
-        self.num_good_agents = num_good_agents
+        super().__init__(num_good_agents=num_good_agents)
         self.gamma = gamma
         self.lam = lam
         self.delta = delta
         self.cg_iters = cg_iters
         self.damping = damping
 
-    _OBS_DIMS = {"adversary_0": 8, "agent_0": 10, "agent_1": 10}
-
     def _build_controllers(self, seed: int) -> dict[str, TRPOController]:
         return {
             ag: TRPOController(obs_dim=dim, seed=seed + i * 100)
-            for i, (ag, dim) in enumerate(self._OBS_DIMS.items())
+            for i, (ag, dim) in enumerate(AGENT_OBS_DIMS.items())
         }
-
-    def _build_env(self, seed: int):
-        lm_cfgs = [
-            LandmarkConfig(position=np.array([0.6, 0.0]), name="goal_0"),
-            LandmarkConfig(position=np.array([-0.6, 0.0]), name="goal_1"),
-        ]
-        follower_goal_weights = {
-            "agent_0": np.array([0.8, 0.2]),
-            "agent_1": np.array([0.2, 0.8]),
-        }
-        return build_custom_env(
-            num_good_agents=self.num_good_agents,
-            landmark_configs=lm_cfgs,
-            follower_goal_weights=follower_goal_weights,
-            max_cycles=25,
-            continuous_actions=True,
-            render_mode=None,
-        )
 
     def train(
         self,
@@ -336,13 +294,11 @@ class TRPOBenchmark:
         """Train all controllers for ``num_episodes`` episodes."""
         controllers = self._build_controllers(seed)
         value_nets = {ag: controllers[ag].value_net for ag in controllers}
-
         episode_returns: list[dict] = []
 
         for ep in range(num_episodes):
             env = self._build_env(seed + ep)
             env.reset(seed=seed + ep)
-
             rollouts = collect_rollout(env, controllers, value_nets)
             env.close()
 
@@ -350,29 +306,21 @@ class TRPOBenchmark:
             for ag, rollout in rollouts.items():
                 if not rollout.rewards:
                     continue
-
                 policy = controllers[ag].policy
                 vnet = value_nets[ag]
-
-                last_val = 0.0
                 advantages, returns = compute_gae(
-                    rollout.rewards, rollout.values, last_val,
-                    self.gamma, self.lam,
+                    rollout.rewards, rollout.values, 0.0, self.gamma, self.lam,
                 )
-
-                old_log_probs = np.array(rollout.log_probs, dtype=np.float64)
-
                 _trpo_update(
                     policy,
                     rollout.observations,
                     rollout.actions,
-                    old_log_probs,
+                    np.array(rollout.log_probs, dtype=np.float64),
                     advantages,
                     delta=self.delta,
                     cg_iters=self.cg_iters,
                     damping=self.damping,
                 )
-
                 vnet.update(rollout.observations, returns, epochs=4)
                 ep_rewards[ag] = float(np.sum(rollout.rewards))
 
@@ -383,74 +331,7 @@ class TRPOBenchmark:
 
         for ctrl in controllers.values():
             ctrl.deterministic = True
-
         return controllers
-
-    def evaluate(
-        self,
-        controllers: dict[str, TRPOController],
-        seed: int = 9999,
-        num_eval_episodes: int = 10,
-    ) -> dict:
-        """Evaluate trained controllers."""
-        all_cum_rewards: list[dict] = []
-        for ep in range(num_eval_episodes):
-            env = self._build_env(seed + ep)
-            env.reset(seed=seed + ep)
-            cum_rewards = {ag: 0.0 for ag in env.possible_agents}
-            for agent in env.agent_iter():
-                obs, rew, term, trunc, _ = env.last()
-                cum_rewards[agent] += rew
-                if term or trunc:
-                    env.step(None)
-                else:
-                    action = controllers[agent].get_action(obs)
-                    env.step(action)
-            env.close()
-            all_cum_rewards.append(cum_rewards)
-
-        mean_rewards = {
-            ag: float(np.mean([r[ag] for r in all_cum_rewards]))
-            for ag in all_cum_rewards[0]
-        }
-        return {"mean_rewards": mean_rewards, "all_episode_rewards": all_cum_rewards}
-
-    @classmethod
-    def run(
-        cls,
-        num_episodes: int = 200,
-        num_eval_episodes: int = 10,
-        seed: int = 0,
-        verbose: bool = True,
-        **kwargs,
-    ) -> dict:
-        """Train then evaluate all agents with TRPO.
-
-        Parameters
-        ----------
-        num_episodes : int
-        num_eval_episodes : int
-        seed : int
-        verbose : bool
-        **kwargs
-            Forwarded to :class:`TRPOBenchmark` constructor.
-
-        Returns
-        -------
-        dict with keys ``"name"``, ``"controllers"``, ``"mean_rewards"``,
-        ``"all_episode_rewards"``.
-        """
-        bench = cls(**kwargs)
-        print(f"=== {bench.NAME}: training for {num_episodes} episodes ===")
-        controllers = bench.train(num_episodes=num_episodes, seed=seed, verbose=verbose)
-        print(f"=== {bench.NAME}: evaluating for {num_eval_episodes} episodes ===")
-        eval_result = bench.evaluate(controllers, seed=seed + 10000, num_eval_episodes=num_eval_episodes)
-        print(f"=== {bench.NAME}: mean_rewards = {eval_result['mean_rewards']} ===")
-        return {
-            "name": bench.NAME,
-            "controllers": controllers,
-            **eval_result,
-        }
 
 
 if __name__ == "__main__":

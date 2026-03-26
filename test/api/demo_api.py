@@ -66,7 +66,7 @@ def save_episode_gif(frames: list[np.ndarray], gif_path: str, fps: int = 5) -> s
     return gif_path
 
 
-def run_episode(max_cycles=25, seed=0, save_gif=True, gif_path="outputs/episode.gif", gif_fps=5):
+def run_episode(max_cycles=25, seed=0, save_gif=True, gif_path="outputs/episode.gif", gif_fps=5, controllers=None):
     lm_cfgs = [
         LandmarkConfig(position=np.array([0.6, 0.0]), name="goal_0"),
         LandmarkConfig(position=np.array([-0.6, 0.0]), name="goal_1"),
@@ -85,11 +85,12 @@ def run_episode(max_cycles=25, seed=0, save_gif=True, gif_path="outputs/episode.
         render_mode=None,  # 不用内置render，完全自绘
     )
 
-    controllers = {
-        "adversary_0": LeaderController(rng=np.random.default_rng(seed + 101)),
-        "agent_0": FollowerController(rng=np.random.default_rng(seed + 201)),
-        "agent_1": FollowerController(rng=np.random.default_rng(seed + 301)),
-    }
+    if controllers is None:
+        controllers = {
+            "adversary_0": LeaderController(rng=np.random.default_rng(seed + 101)),
+            "agent_0": FollowerController(rng=np.random.default_rng(seed + 201)),
+            "agent_1": FollowerController(rng=np.random.default_rng(seed + 301)),
+        }
 
     env.reset(seed=seed)
     cumulative_rewards = {a: 0.0 for a in env.possible_agents}
@@ -146,6 +147,80 @@ def plot_rewards(step_rewards: list[dict[str, float]], fig_path: str = "outputs/
     plt.savefig(fig_path, dpi=150)
     plt.close()
     return fig_path
+
+
+def run_rl_episode(
+    algo: str = "ppo",
+    num_episodes: int = 200,
+    max_cycles: int = 25,
+    seed: int = 0,
+    save_gif: bool = True,
+    gif_path: str | None = None,
+    gif_fps: int = 5,
+    verbose: bool = False,
+    **algo_kwargs,
+) -> dict:
+    """Train RL controllers then run one evaluation episode.
+
+    This is the main entry point for running any RL algorithm end-to-end
+    from ``demo_api``.
+
+    Parameters
+    ----------
+    algo : str
+        Algorithm name – one of ``"ppo"``, ``"trpo"``, ``"a2c"``,
+        ``"entropy_rl"``, ``"reinforce"``.
+        See :data:`controller_api.AVAILABLE_ALGOS` for the full list.
+    num_episodes : int
+        Number of training episodes.
+    max_cycles : int
+        Steps per evaluation episode.
+    seed : int
+        Master random seed.
+    save_gif : bool
+        Whether to save the episode as a GIF.
+    gif_path : str | None
+        Output GIF path.  When ``None`` (default), saves to
+        ``outputs/<algo>_episode.gif``.
+    gif_fps : int
+        Frames per second for the GIF.
+    verbose : bool
+        Print training progress.
+    **algo_kwargs
+        Extra keyword arguments forwarded to the algorithm benchmark
+        constructor (e.g. ``lr=1e-3``, ``clip_eps=0.1`` for PPO).
+
+    Returns
+    -------
+    dict with keys ``"cumulative_rewards"``, ``"step_rewards"``,
+    ``"gif_path"``, ``"plt_path"``.
+
+    Examples
+    --------
+    ::
+
+        from demo_api import run_rl_episode
+        out = run_rl_episode("ppo", num_episodes=100, seed=0)
+        print(out["cumulative_rewards"])
+    """
+    if gif_path is None:
+        gif_path = f"outputs/{algo.lower()}_episode.gif"
+
+    controllers = build_rl_controllers(
+        algo=algo,
+        num_episodes=num_episodes,
+        seed=seed,
+        verbose=verbose,
+        **algo_kwargs,
+    )
+    return run_episode(
+        max_cycles=max_cycles,
+        seed=seed,
+        save_gif=save_gif,
+        gif_path=gif_path,
+        gif_fps=gif_fps,
+        controllers=controllers,
+    )
 
 
 if __name__ == "__main__":
