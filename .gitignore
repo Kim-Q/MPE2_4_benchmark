@@ -175,4 +175,4 @@ scripts/
 _site
 docs/_build/
 docs/build/
-_build/
+_build/outputs/
